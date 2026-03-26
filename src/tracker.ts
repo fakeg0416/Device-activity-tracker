@@ -103,6 +103,7 @@ export class WhatsAppTracker {
     private probeStartTimes: Map<string, number> = new Map();
     private probeTimeouts: Map<string, NodeJS.Timeout> = new Map();
     private lastPresence: string | null = null;
+    private lastPresenceTimestamp: number = 0; // Timestamp of last presence update
     private probeMethod: ProbeMethod = 'delete'; // Default to delete method
     public onUpdate?: (data: any) => void;
 
@@ -166,6 +167,7 @@ export class WhatsAppTracker {
                         this.trackedJids.add(jid);
                         const presenceValue = presenceData.lastKnownPresence as string;
                         this.lastPresence = presenceValue;
+                        this.lastPresenceTimestamp = Date.now();
                         trackerLogger.debug(`[PRESENCE] ${jid} -> ${presenceValue}`);
 
                         // Normalize JID to avoid duplicate entries for same device
@@ -219,6 +221,32 @@ export class WhatsAppTracker {
             if (!this.isTracking) { clearInterval(presenceInterval); return; }
             subscribeToPresence();
         }, 30000);
+
+        // Presence timeout: if the last Online presence is older than 45s, downgrade to Standby.
+        // WhatsApp sends 'unavailable' when the user leaves, but this isn't always reliable —
+        // especially when network drops or privacy settings are active.
+        const PRESENCE_STALE_MS = 45000;
+        const presenceStaleInterval = setInterval(() => {
+            if (!this.isTracking) { clearInterval(presenceStaleInterval); return; }
+            const isOnlinePresence =
+                this.lastPresence === 'available' ||
+                this.lastPresence === 'composing' ||
+                this.lastPresence === 'paused';
+            const isStale = this.lastPresenceTimestamp > 0 &&
+                Date.now() - this.lastPresenceTimestamp > PRESENCE_STALE_MS;
+
+            if (isOnlinePresence && isStale) {
+                trackerLogger.debug('[PRESENCE STALE] Presence not refreshed for 45s — downgrading Online → Standby');
+                this.lastPresence = 'unavailable';
+                for (const [, m] of this.deviceMetrics.entries()) {
+                    if (m.state === 'Online') {
+                        m.state = 'Standby';
+                        m.lastUpdate = Date.now();
+                    }
+                }
+                this.sendUpdate();
+            }
+        }, 5000);
 
         // Send initial state update
         if (this.onUpdate) {
@@ -578,16 +606,17 @@ export class WhatsAppTracker {
 
             // ONLY presence determines Online — RTT alone cannot distinguish
             // "actively using WhatsApp" from "phone receiving in background"
-            if (this.lastPresence === 'available' || this.lastPresence === 'composing') {
+            // 'paused' = user stopped typing but is still in the chat (app on foreground) → Online
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
                 metrics.state = 'Online';
-            } else if (this.lastPresence === 'unavailable' || this.lastPresence === 'paused') {
+            } else if (this.lastPresence === 'unavailable') {
                 metrics.state = 'Standby';
             } else {
                 // No presence data (privacy settings) — device is reachable but status unknown
                 metrics.state = 'Standby';
             }
         } else {
-            if (this.lastPresence === 'available' || this.lastPresence === 'composing') {
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
                 metrics.state = 'Online';
             } else {
                 metrics.state = 'Calibrating...';
@@ -617,9 +646,12 @@ export class WhatsAppTracker {
 
         // If no RTT data yet but presence is known, show a virtual entry
         if (devices.length === 0 && this.lastPresence) {
+            const onlinePresence = this.lastPresence === 'available' ||
+                this.lastPresence === 'composing' ||
+                this.lastPresence === 'paused';
             devices = [{
                 jid: this.targetJid,
-                state: this.lastPresence === 'available' ? 'Online' : 'Standby',
+                state: onlinePresence ? 'Online' : 'Standby',
                 rtt: 0,
                 avg: 0
             }];

@@ -846,3 +846,130 @@ npx serve -s build -l 3000
 ---
 
 *Patches gedocumenteerd op 2026-03-24*
+
+---
+
+## Patch v2 — 2026-03-26
+
+### Gewijzigd bestand: `src/tracker.ts`
+
+#### Wijziging 1 — `paused` presence → Online (was: Standby)
+
+**Probleem:** WhatsApp's `paused` presence betekent dat de gebruiker gestopt is met typen maar nog steeds in de chat zit (app op de voorgrond). Dit werd ten onrechte als `Standby` geclassificeerd in `determineDeviceState`, terwijl de presence-handler het al correct als `Online` behandelde. Inconsistentie op drie plekken.
+
+**Zoek (origineel) in `determineDeviceState`:**
+```ts
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing') {
+                metrics.state = 'Online';
+            } else if (this.lastPresence === 'unavailable' || this.lastPresence === 'paused') {
+                metrics.state = 'Standby';
+            } else {
+                metrics.state = 'Standby';
+            }
+        } else {
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing') {
+                metrics.state = 'Online';
+            } else {
+                metrics.state = 'Calibrating...';
+            }
+        }
+```
+
+**Vervang door:**
+```ts
+            // 'paused' = user stopped typing but is still in the chat (app on foreground) → Online
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
+                metrics.state = 'Online';
+            } else if (this.lastPresence === 'unavailable') {
+                metrics.state = 'Standby';
+            } else {
+                metrics.state = 'Standby';
+            }
+        } else {
+            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
+                metrics.state = 'Online';
+            } else {
+                metrics.state = 'Calibrating...';
+            }
+        }
+```
+
+---
+
+#### Wijziging 2 — Presence-timeout: Online vervalt na 45 seconden
+
+**Probleem:** Als de gebruiker WhatsApp sloot of zijn scherm uitdeed stuurde WhatsApp niet altijd een `unavailable` presence. De status bleef dan onbeperkt op `Online` staan, ook al was de gebruiker allang weg.
+
+**Voeg property toe** bovenaan de klasse (bij de andere `private` properties):
+```ts
+    private lastPresenceTimestamp: number = 0;
+```
+
+**Voeg toe** in de presence handler, direct na `this.lastPresence = presenceValue;`:
+```ts
+                        this.lastPresenceTimestamp = Date.now();
+```
+
+**Voeg toe** in `startTracking`, direct na het `presenceInterval` setInterval-blok:
+```ts
+        // Presence timeout: if the last Online presence is older than 45s, downgrade to Standby.
+        const PRESENCE_STALE_MS = 45000;
+        const presenceStaleInterval = setInterval(() => {
+            if (!this.isTracking) { clearInterval(presenceStaleInterval); return; }
+            const isOnlinePresence =
+                this.lastPresence === 'available' ||
+                this.lastPresence === 'composing' ||
+                this.lastPresence === 'paused';
+            const isStale = this.lastPresenceTimestamp > 0 &&
+                Date.now() - this.lastPresenceTimestamp > PRESENCE_STALE_MS;
+
+            if (isOnlinePresence && isStale) {
+                trackerLogger.debug('[PRESENCE STALE] Presence not refreshed for 45s — downgrading Online → Standby');
+                this.lastPresence = 'unavailable';
+                for (const [, m] of this.deviceMetrics.entries()) {
+                    if (m.state === 'Online') {
+                        m.state = 'Standby';
+                        m.lastUpdate = Date.now();
+                    }
+                }
+                this.sendUpdate();
+            }
+        }, 5000);
+```
+
+---
+
+#### Wijziging 3 — `sendUpdate` virtual entry: ook `composing`/`paused` → Online
+
+**Probleem:** De virtual entry (getoond vóór de eerste RTT-meting) gaf alleen `Online` bij `available`, niet bij `composing` of `paused`.
+
+**Zoek (origineel):**
+```ts
+        if (devices.length === 0 && this.lastPresence) {
+            devices = [{
+                jid: this.targetJid,
+                state: this.lastPresence === 'available' ? 'Online' : 'Standby',
+                rtt: 0,
+                avg: 0
+            }];
+        }
+```
+
+**Vervang door:**
+```ts
+        if (devices.length === 0 && this.lastPresence) {
+            const onlinePresence = this.lastPresence === 'available' ||
+                this.lastPresence === 'composing' ||
+                this.lastPresence === 'paused';
+            devices = [{
+                jid: this.targetJid,
+                state: onlinePresence ? 'Online' : 'Standby',
+                rtt: 0,
+                avg: 0
+            }];
+        }
+```
+
+---
+
+*Patches gedocumenteerd op 2026-03-26*
