@@ -92,6 +92,19 @@ WAT IS ER GEWIJZIGD?
     - sendUpdate virtual entry: ook 'composing' en 'paused' geven nu
       correct Online (was alleen 'available')
 
+  tracker.ts (v3 — 2026-03-26)
+    - Bug opgelost: één gemiste probe markeerde het apparaat direct als
+      OFFLINE. Nu zijn er 3 opeenvolgende timeouts nodig (consecutive
+      counter). Hiermee verdwijnen valse OFFLINE-flikkering bij
+      netwerk-pieken.
+    - Bug opgelost: bij privacy-instellingen ("Online" verbergen) bleef
+      de status altijd op Standby, ook als de persoon actief in WhatsApp
+      zat. RTT-heuristiek toegevoegd als fallback: als het gemiddelde RTT
+      ≤75% van de historische mediaan is, wordt Online getoond.
+    - Bug opgelost: actieve delivery-ACKs (CB:receipt zonder type) werden
+      stilletjes genegeerd. handleRawReceipt verwerkt nu ook dit type,
+      waardoor geen CLIENT ACK meer verloren gaat.
+
   Login.tsx
     - Signal QR-code ververst automatisch elke 25 seconden
       (voorheen verliep de QR zonder dat de pagina dit doorhad)

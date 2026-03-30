@@ -72,8 +72,8 @@ export function Dashboard({ connectionState }: DashboardProps) {
                         updatedContact.devices = data.devices;
                     }
 
-                    // Add to chart data
-                    if (data.median !== undefined && data.devices && data.devices.length > 0) {
+                    // Add to chart data (skip virtual entries with rtt=0, cap at 300 points)
+                    if (data.median !== undefined && data.devices && data.devices.length > 0 && data.devices[0].rtt > 0) {
                         const newDataPoint: TrackerData = {
                             rtt: data.devices[0].rtt,
                             avg: data.devices[0].avg,
@@ -82,7 +82,8 @@ export function Dashboard({ connectionState }: DashboardProps) {
                             state: data.devices.find((d: DeviceInfo) => d.state.includes('Online'))?.state || data.devices[0].state,
                             timestamp: Date.now(),
                         };
-                        updatedContact.data = [...updatedContact.data, newDataPoint];
+                        const newData = [...updatedContact.data, newDataPoint];
+                        updatedContact.data = newData.length > 300 ? newData.slice(-300) : newData;
                     }
 
                     next.set(jid, updatedContact);

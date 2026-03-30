@@ -972,4 +972,76 @@ npx serve -s build -l 3000
 
 ---
 
-*Patches gedocumenteerd op 2026-03-26*
+*Patches gedocumenteerd op 2026-03-26 (v2)*
+
+---
+
+## Patch v3 — 2026-03-26 (bugfix: online/offline/standby nauwkeurigheid)
+
+### Gewijzigd bestand: `src/tracker.ts`
+
+#### Probleem A — OFFLINE bij één gemiste probe (valse OFFLINE)
+
+**Oorzaak:** Bij 400-500ms probe-interval zijn er altijd 6-7 probes tegelijk in de lucht. Eén probe die door een netwerk-piek iets te laat terugkwam zette de status direct op OFFLINE — constant flikkeren op grillige verbindingen.
+
+**Oplossing:** Nieuwe `consecutiveTimeouts` counter. Pas na **3 opeenvolgende** gemiste probes wordt OFFLINE aangeroepen. Elke succesvolle ACK reset de counter naar 0.
+
+**Voeg toe** bij de andere `private` properties:
+```ts
+    private consecutiveTimeouts: number = 0;
+    private readonly OFFLINE_PROBE_THRESHOLD = 3;
+```
+
+**Vervang** de timeout-callback in **beide** probes (sendDeleteProbe + sendReactionProbe):
+```ts
+                        this.consecutiveTimeouts++;
+                        if (this.consecutiveTimeouts >= this.OFFLINE_PROBE_THRESHOLD) {
+                            if (result.key.remoteJid) {
+                                this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                            }
+                        }
+```
+
+**Voeg toe** in `processAck` direct na `if (startTime) {`:
+```ts
+            this.consecutiveTimeouts = 0;
+```
+
+---
+
+#### Probleem B — Altijd Standby bij privacy-instellingen
+
+**Oorzaak:** Als het doelcontact "Online" verborgen heeft, stuurt WhatsApp nooit een presence-update. `lastPresence` blijft `null`, waardoor de tracker altijd `Standby` toont, ook als de persoon actief in WhatsApp zit.
+
+**Oplossing:** RTT-heuristiek als fallback. Als RTT-gemiddelde ≤ 75% van de historische mediaan → `Online` (apparaat reageert aantoonbaar sneller = WhatsApp op voorgrond). Anders → `Standby`.
+
+**Zoek** in `determineDeviceState`, het `else`-blok voor "No presence data":
+```ts
+            } else {
+                metrics.state = 'Standby';
+            }
+```
+
+**Vervang door:**
+```ts
+            } else {
+                // RTT heuristic fallback for privacy-mode contacts
+                if (metrics.recentRtts.length >= 3 && movingAvg <= median * 0.75) {
+                    metrics.state = 'Online';
+                } else {
+                    metrics.state = 'Standby';
+                }
+            }
+```
+
+---
+
+#### Probleem C — Actieve delivery-ACKs werden stilletjes genegeerd
+
+**Oorzaak:** `handleRawReceipt` verwerkte alleen `type='inactive'`. Baileys laat actieve delivery-receipts (geen type) intern vallen voor protocol-berichten zoals delete-probes. Hierdoor kwamen CLIENT ACKs van actieve apparaten niet altijd aan.
+
+**Oplossing:** `handleRawReceipt` verwerkt nu zowel lege-type als `inactive`. De methode filtert `read` en `server` eruit en verwerkt de rest. Zie `src/tracker.ts` voor de volledige implementatie.
+
+---
+
+*Patches gedocumenteerd op 2026-03-26 (v3)*

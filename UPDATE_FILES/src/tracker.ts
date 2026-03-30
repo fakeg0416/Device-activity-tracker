@@ -107,6 +107,12 @@ export class WhatsAppTracker {
     private probeMethod: ProbeMethod = 'delete'; // Default to delete method
     public onUpdate?: (data: any) => void;
 
+    // Consecutive timeouts counter — require multiple missed probes before marking OFFLINE.
+    // With probes every 400-500ms and a 3.5s timeout, network hiccups can cause a single
+    // probe to miss its ACK without the device actually being offline.
+    private consecutiveTimeouts: number = 0;
+    private readonly OFFLINE_PROBE_THRESHOLD = 3; // Mark OFFLINE only after this many consecutive timeouts
+
     constructor(sock: WASocket, targetJid: string, debugMode: boolean = false) {
         this.sock = sock;
         this.targetJid = targetJid;
@@ -314,17 +320,24 @@ export class WhatsAppTracker {
                 trackerLogger.debug(`[PROBE-DELETE] Delete probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
 
-                // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
+                // Set timeout: if no CLIENT ACK within 3.5s, increment consecutive miss counter.
+                // Only mark OFFLINE after OFFLINE_PROBE_THRESHOLD consecutive misses.
                 const timeoutId = setTimeout(() => {
                     if (this.probeStartTimes.has(result.key.id!)) {
                         const elapsedTime = Date.now() - startTime;
-                        trackerLogger.debug(`[PROBE-DELETE TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
                         this.probeStartTimes.delete(result.key.id!);
                         this.probeTimeouts.delete(result.key.id!);
+                        this.consecutiveTimeouts++;
 
-                        // Mark device as OFFLINE due to no response
-                        if (result.key.remoteJid) {
-                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        trackerLogger.debug(
+                            `[PROBE-DELETE TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms` +
+                            ` (miss ${this.consecutiveTimeouts}/${this.OFFLINE_PROBE_THRESHOLD})`
+                        );
+
+                        if (this.consecutiveTimeouts >= this.OFFLINE_PROBE_THRESHOLD) {
+                            if (result.key.remoteJid) {
+                                this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                            }
                         }
                     }
                 }, 3500); // 3.5 seconds timeout
@@ -373,17 +386,24 @@ export class WhatsAppTracker {
                 trackerLogger.debug(`[PROBE-REACTION] Probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
 
-                // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
+                // Set timeout: if no CLIENT ACK within 3.5s, increment consecutive miss counter.
+                // Only mark OFFLINE after OFFLINE_PROBE_THRESHOLD consecutive misses.
                 const timeoutId = setTimeout(() => {
                     if (this.probeStartTimes.has(result.key.id!)) {
                         const elapsedTime = Date.now() - startTime;
-                        trackerLogger.debug(`[PROBE-REACTION TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
                         this.probeStartTimes.delete(result.key.id!);
                         this.probeTimeouts.delete(result.key.id!);
+                        this.consecutiveTimeouts++;
 
-                        // Mark device as OFFLINE due to no response
-                        if (result.key.remoteJid) {
-                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        trackerLogger.debug(
+                            `[PROBE-REACTION TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms` +
+                            ` (miss ${this.consecutiveTimeouts}/${this.OFFLINE_PROBE_THRESHOLD})`
+                        );
+
+                        if (this.consecutiveTimeouts >= this.OFFLINE_PROBE_THRESHOLD) {
+                            if (result.key.remoteJid) {
+                                this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                            }
                         }
                     }
                 }, 3500); // 3.5 seconds timeout
@@ -404,29 +424,43 @@ export class WhatsAppTracker {
     private handleRawReceipt(node: any) {
         try {
             const { attrs } = node;
-            // We only care about 'inactive' receipts here
-            if (attrs.type === 'inactive') {
-                trackerLogger.debug(`[RAW RECEIPT] Received inactive receipt: ${JSON.stringify(attrs)}`);
+            const receiptType: string = attrs.type ?? '';
 
-                const msgId = attrs.id;
-                const fromJid = attrs.from;
+            // Handle both active delivery (no type / empty) and inactive delivery.
+            //
+            // Baileys internally converts empty-type receipts to messages.update status=3,
+            // but that pipeline can silently drop receipts for protocol messages (delete probes).
+            // Listening directly to CB:receipt here provides a reliable fallback so no ACK is lost.
+            //
+            // Receipt types:
+            //   ''         – active delivery (device received while app was in foreground)
+            //   'inactive' – background delivery (device received while app was in background)
+            //   'read'     – user opened and read the message (skip, not needed for RTT)
+            //   'server'   – server received it (skip, not a device receipt)
+            if (receiptType !== '' && receiptType !== 'inactive') {
+                // 'read', 'server', 'retry', etc. — not relevant for RTT
+                return;
+            }
 
-                // Guard against missing from attribute
-                if (!fromJid) {
-                    trackerLogger.debug('[RAW RECEIPT] Missing from JID in receipt');
-                    return;
-                }
+            trackerLogger.debug(`[RAW RECEIPT] type="${receiptType}" id=${attrs.id} from=${attrs.from}`);
 
-                // Extract base number from device JID (e.g., "15109129852:22@s.whatsapp.net" -> "15109129852")
-                const baseNumber = fromJid.split('@')[0].split(':')[0];
+            const msgId = attrs.id;
+            const fromJid = attrs.from;
 
-                // Check if this matches our target (with or without device ID)
-                const isTracked = this.trackedJids.has(fromJid) ||
-                                  this.trackedJids.has(`${baseNumber}@s.whatsapp.net`);
+            if (!fromJid || !msgId) {
+                trackerLogger.debug('[RAW RECEIPT] Missing from or id in receipt');
+                return;
+            }
 
-                if (isTracked) {
-                    this.processAck(msgId, fromJid, 'inactive');
-                }
+            // Extract base number from device JID (e.g., "31611753005:22@s.whatsapp.net" → "31611753005")
+            const baseNumber = fromJid.split('@')[0].split(':')[0];
+
+            // Check if this matches our target (with or without device suffix)
+            const isTracked = this.trackedJids.has(fromJid) ||
+                              this.trackedJids.has(`${baseNumber}@s.whatsapp.net`);
+
+            if (isTracked) {
+                this.processAck(msgId, fromJid, receiptType === 'inactive' ? 'inactive' : 'active');
             }
         } catch (err) {
             trackerLogger.debug(`[RAW RECEIPT] Error handling receipt: ${err}`);
@@ -447,6 +481,9 @@ export class WhatsAppTracker {
         if (startTime) {
             const rtt = Date.now() - startTime;
             trackerLogger.debug(`[TRACKING] ✅ ${type.toUpperCase()} received for ${msgId} from ${fromJid}, RTT: ${rtt}ms`);
+
+            // Successful ACK — reset the consecutive miss counter
+            this.consecutiveTimeouts = 0;
 
             // Clear timeout
             const timeoutId = this.probeTimeouts.get(msgId);
@@ -604,16 +641,22 @@ export class WhatsAppTracker {
             median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
             threshold = median * 1.2;
 
-            // ONLY presence determines Online — RTT alone cannot distinguish
-            // "actively using WhatsApp" from "phone receiving in background"
+            // Presence is ground truth when available
             // 'paused' = user stopped typing but is still in the chat (app on foreground) → Online
             if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
                 metrics.state = 'Online';
             } else if (this.lastPresence === 'unavailable') {
                 metrics.state = 'Standby';
             } else {
-                // No presence data (privacy settings) — device is reachable but status unknown
-                metrics.state = 'Standby';
+                // No presence data (privacy settings block last seen / online status).
+                // Fall back to RTT heuristic: when WhatsApp is in the foreground the device
+                // processes messages faster, so RTT drops noticeably below its own median.
+                // Threshold: if moving average is ≤75% of median → device is actively in use.
+                if (metrics.recentRtts.length >= 3 && movingAvg <= median * 0.75) {
+                    metrics.state = 'Online';
+                } else {
+                    metrics.state = 'Standby';
+                }
             }
         } else {
             if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
