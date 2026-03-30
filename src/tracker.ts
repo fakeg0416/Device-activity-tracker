@@ -103,16 +103,22 @@ export class WhatsAppTracker {
     private probeStartTimes: Map<string, number> = new Map();
     private probeTimeouts: Map<string, NodeJS.Timeout> = new Map();
     private lastPresence: string | null = null;
-    private lastPresenceTimestamp: number = 0; // Timestamp of last presence update
-    private probeMethod: ProbeMethod = 'delete'; // Default to delete method
+    private lastPresenceTimestamp: number = 0;
+    private probeMethod: ProbeMethod = 'delete';
     public onUpdate?: (data: any) => void;
 
+    // Receipt type tracking — the most reliable signal for Online vs Standby.
+    // 'active'   = WhatsApp was in the foreground when the device processed the probe
+    // 'inactive' = WhatsApp was in the background (device on, app not in foreground)
+    // 'unknown'  = receipt came through Baileys messages.update (no type info)
+    private lastReceiptType: string = 'unknown';
+    private recentReceiptTypes: string[] = []; // Last 5 receipt types for stability
+    private readonly RECEIPT_WINDOW = 5;
+
     // Consecutive timeouts counter — require multiple missed probes before marking OFFLINE.
-    // With probes every 400-500ms and a 3.5s timeout, network hiccups can cause a single
-    // probe to miss its ACK without the device actually being offline.
     private consecutiveTimeouts: number = 0;
-    private readonly OFFLINE_PROBE_THRESHOLD = 3; // Mark OFFLINE only after this many consecutive timeouts
-    private intervalIds: NodeJS.Timeout[] = []; // Track intervals for cleanup
+    private readonly OFFLINE_PROBE_THRESHOLD = 3;
+    private intervalIds: NodeJS.Timeout[] = [];
 
     constructor(sock: WASocket, targetJid: string, debugMode: boolean = false) {
         this.sock = sock;
@@ -488,6 +494,15 @@ export class WhatsAppTracker {
             // Successful ACK — reset the consecutive miss counter
             this.consecutiveTimeouts = 0;
 
+            // Track receipt type for Online/Standby detection
+            this.lastReceiptType = type;
+            if (type === 'active' || type === 'inactive') {
+                this.recentReceiptTypes.push(type);
+                if (this.recentReceiptTypes.length > this.RECEIPT_WINDOW) {
+                    this.recentReceiptTypes.shift();
+                }
+            }
+
             // Clear timeout
             const timeoutId = this.probeTimeouts.get(msgId);
             if (timeoutId) {
@@ -611,30 +626,31 @@ export class WhatsAppTracker {
     }
 
     /**
-     * Determine device state (Online/Standby/Offline) based on RTT analysis
-     * @param jid Device JID
+     * Determine device state (Online/Standby/Offline) based on multiple signals.
+     *
+     * Detection priority (most reliable → least reliable):
+     *   1. Receipt type: 'active' = WhatsApp foreground → Online
+     *                    'inactive' = WhatsApp background → Standby
+     *   2. Presence:     'available'/'composing'/'paused' → Online
+     *                    'unavailable' → Standby
+     *   3. RTT heuristic: moving avg significantly below median → Online
+     *   4. Default: device is reachable → Standby
      */
     private determineDeviceState(jid: string) {
         const metrics = this.deviceMetrics.get(jid);
         if (!metrics) return;
 
-        // If device is marked as OFFLINE (no CLIENT ACK received), keep that state
-        // Only change back to Online/Standby if we receive new measurements
+        // If device was OFFLINE but we just received a new measurement, it came back
         if (metrics.state === 'OFFLINE') {
-            // Check if this is a new measurement (device came back online)
             if (metrics.lastRtt <= 3500 && metrics.recentRtts.length > 0) {
                 trackerLogger.debug(`[DEVICE ${jid}] Device came back online (RTT: ${metrics.lastRtt}ms)`);
-                // Continue with normal state determination below
             } else {
-                trackerLogger.debug(`[DEVICE ${jid}] Maintaining OFFLINE state`);
                 return;
             }
         }
 
-        // Calculate device's moving average
-        const movingAvg = metrics.recentRtts.reduce((a: number, b: number) => a + b, 0) / metrics.recentRtts.length;
-
-        // Calculate global median and threshold
+        // Calculate stats
+        const movingAvg = metrics.recentRtts.reduce((a, b) => a + b, 0) / metrics.recentRtts.length;
         let median = 0;
         let threshold = 0;
 
@@ -643,37 +659,70 @@ export class WhatsAppTracker {
             const mid = Math.floor(sorted.length / 2);
             median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
             threshold = median * 1.2;
-
-            // Presence is ground truth when available
-            // 'paused' = user stopped typing but is still in the chat (app on foreground) → Online
-            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
-                metrics.state = 'Online';
-            } else if (this.lastPresence === 'unavailable') {
-                metrics.state = 'Standby';
-            } else {
-                // No presence data (privacy settings block last seen / online status).
-                // Fall back to RTT heuristic: when WhatsApp is in the foreground the device
-                // processes messages faster, so RTT drops noticeably below its own median.
-                // Threshold: if moving average is ≤75% of median → device is actively in use.
-                if (metrics.recentRtts.length >= 3 && movingAvg <= median * 0.75) {
-                    metrics.state = 'Online';
-                } else {
-                    metrics.state = 'Standby';
-                }
-            }
-        } else {
-            if (this.lastPresence === 'available' || this.lastPresence === 'composing' || this.lastPresence === 'paused') {
-                metrics.state = 'Online';
-            } else {
-                metrics.state = 'Calibrating...';
-            }
         }
 
-        // Normal mode: Formatted output
-        trackerLogger.formatDeviceState(jid, metrics.lastRtt, movingAvg, median, threshold, metrics.state);
+        // --- Signal 1: Receipt type (strongest signal) ---
+        // Count recent active vs inactive receipts for stability
+        const activeCount = this.recentReceiptTypes.filter(t => t === 'active').length;
+        const inactiveCount = this.recentReceiptTypes.filter(t => t === 'inactive').length;
+        const hasReceiptData = this.recentReceiptTypes.length >= 2;
 
-        // Debug mode: Additional debug information
-        trackerLogger.debug(`[DEBUG] RTT History length: ${metrics.rttHistory.length}, Global History: ${this.globalRttHistory.length}`);
+        // --- Signal 2: Presence ---
+        const presenceOnline = this.lastPresence === 'available' ||
+            this.lastPresence === 'composing' ||
+            this.lastPresence === 'paused';
+        const presenceStale = this.lastPresenceTimestamp > 0 &&
+            Date.now() - this.lastPresenceTimestamp > 30000;
+
+        // --- Signal 3: RTT heuristic ---
+        const rttIndicatesOnline = median > 0 && metrics.recentRtts.length >= 3 &&
+            movingAvg <= median * 0.80;
+
+        // --- Determine state ---
+        let newState: string;
+
+        if (this.globalRttHistory.length < 3) {
+            // Still calibrating — not enough data yet
+            if (presenceOnline && !presenceStale) {
+                newState = 'Online';
+            } else if (this.lastReceiptType === 'active') {
+                newState = 'Online';
+            } else {
+                newState = 'Calibrating...';
+            }
+        } else if (hasReceiptData && activeCount > inactiveCount) {
+            // Majority of recent receipts are active → WhatsApp is in foreground
+            newState = 'Online';
+        } else if (hasReceiptData && inactiveCount > activeCount) {
+            // Majority of recent receipts are inactive → WhatsApp is in background
+            // But presence can override (e.g. user just opened the app)
+            if (presenceOnline && !presenceStale) {
+                newState = 'Online';
+            } else {
+                newState = 'Standby';
+            }
+        } else if (presenceOnline && !presenceStale) {
+            // No clear receipt data, but presence says online
+            newState = 'Online';
+        } else if (this.lastPresence === 'unavailable') {
+            newState = 'Standby';
+        } else if (rttIndicatesOnline) {
+            // No presence/receipt data — RTT drop suggests active use
+            newState = 'Online';
+        } else {
+            // Device is reachable but no signal indicates active use
+            newState = 'Standby';
+        }
+
+        metrics.state = newState;
+
+        // Formatted console output
+        trackerLogger.formatDeviceState(jid, metrics.lastRtt, movingAvg, median, threshold, newState);
+        trackerLogger.debug(
+            `[STATE] receipt=${this.lastReceiptType} active/inactive=${activeCount}/${inactiveCount}` +
+            ` presence=${this.lastPresence}(stale=${presenceStale}) rttOnline=${rttIndicatesOnline}` +
+            ` → ${newState}`
+        );
     }
 
     /**
@@ -690,14 +739,15 @@ export class WhatsAppTracker {
                 : 0
         }));
 
-        // If no RTT data yet but presence is known, show a virtual entry
-        if (devices.length === 0 && this.lastPresence) {
-            const onlinePresence = this.lastPresence === 'available' ||
+        // If no RTT data yet but presence or receipt type is known, show a virtual entry
+        if (devices.length === 0 && (this.lastPresence || this.lastReceiptType !== 'unknown')) {
+            const isOnline = this.lastReceiptType === 'active' ||
+                this.lastPresence === 'available' ||
                 this.lastPresence === 'composing' ||
                 this.lastPresence === 'paused';
             devices = [{
                 jid: this.targetJid,
-                state: onlinePresence ? 'Online' : 'Standby',
+                state: isOnline ? 'Online' : 'Standby',
                 rtt: 0,
                 avg: 0
             }];

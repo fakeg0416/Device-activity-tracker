@@ -34,27 +34,19 @@ interface ContactCardProps {
     platform?: Platform;
 }
 
-// Status explanations
+// Status explanations — only 3 core states + calibrating
 const STATUS_DESCRIPTIONS: Record<string, { label: string; description: string }> = {
     'Online': {
         label: 'Online',
-        description: 'WhatsApp is open and active op het apparaat. De gebruiker heeft de app op de voorgrond.'
+        description: 'WhatsApp is actief op de voorgrond. Gedetecteerd via receipt-type (active), presence (available/composing), of RTT-patroon.'
     },
     'Standby': {
         label: 'Standby',
-        description: 'Het apparaat is aan en bereikbaar (internet actief), maar WhatsApp staat niet op de voorgrond. De telefoon is aan maar de gebruiker is niet bezig in WhatsApp.'
+        description: 'Het apparaat is aan en bereikbaar, maar WhatsApp staat niet op de voorgrond. De telefoon is aan, maar de gebruiker zit niet in WhatsApp.'
     },
     'OFFLINE': {
         label: 'Offline',
-        description: 'Geen reactie ontvangen. De telefoon is waarschijnlijk uitgeschakeld, heeft geen internet, of staat in vliegtuigmodus.'
-    },
-    'Composing': {
-        label: 'Aan het typen',
-        description: 'De gebruiker is op dit moment een bericht aan het typen in WhatsApp.'
-    },
-    'Paused': {
-        label: 'Gestopt met typen',
-        description: 'De gebruiker was een bericht aan het typen maar is ermee gestopt (bericht nog niet verstuurd).'
+        description: 'Geen reactie na meerdere probes. De telefoon is waarschijnlijk uit, heeft geen internet, of staat in vliegtuigmodus.'
     },
     'Calibrating...': {
         label: 'Kalibreren...',
@@ -102,31 +94,24 @@ export function ContactCard({
             devices[0].state)
         : 'Unknown';
 
-    // Presence takes priority for online/composing/paused
+    // Composing/paused/available all mean the user is in WhatsApp → Online
     const currentStatus =
-        presence === 'composing' ? 'Composing' :
-        presence === 'paused' ? 'Paused' :
-        presence === 'available' ? 'Online' :
-        rawDeviceStatus;
+        (presence === 'composing' || presence === 'paused' || presence === 'available')
+            ? 'Online'
+            : rawDeviceStatus;
 
     const statusDotClass =
         currentStatus === 'OFFLINE' ? 'bg-red-500' :
-        currentStatus === 'Composing' ? 'bg-blue-500' :
-        currentStatus === 'Paused' ? 'bg-purple-500' :
         currentStatus.includes('Online') ? 'bg-green-500' :
         currentStatus === 'Standby' ? 'bg-yellow-400' : 'bg-gray-400';
 
     const statusBadgeClass =
         currentStatus === 'OFFLINE' ? 'bg-red-100 text-red-700' :
-        currentStatus === 'Composing' ? 'bg-blue-100 text-blue-700' :
-        currentStatus === 'Paused' ? 'bg-purple-100 text-purple-700' :
         currentStatus.includes('Online') ? 'bg-green-100 text-green-700' :
         currentStatus === 'Standby' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-700';
 
     const deviceStateBadgeClass = (state: string) =>
         state === 'OFFLINE' ? 'bg-red-100 text-red-700' :
-        state === 'Composing' ? 'bg-blue-100 text-blue-700' :
-        state === 'Paused' ? 'bg-purple-100 text-purple-700' :
         state.includes('Online') ? 'bg-green-100 text-green-700' :
         state === 'Standby' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-700';
 
